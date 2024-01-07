@@ -6,52 +6,45 @@ import (
 )
 
 type scheduler struct {
-	doneMarker       atomic.Bool
-	validationIndex  atomic.Int32
-	executionIndex   atomic.Int32
-	numActiveTasks   atomic.Int32
-	decreaseCount    atomic.Int32
-	allTxnStatus     []*txnStatus
-	allTxnDependency []*txnDependency // blocked transactions  on each index
-	allTxnBlockers   []*txnBlockers   // blocking transactions for each index
-	blockSize        int
+	doneMarker      atomic.Bool
+	validationIndex atomic.Int32
+	executionIndex  atomic.Int32
+	numActiveTasks  atomic.Int32
+	decreaseCount   atomic.Int32
+	allTxnState     []*txnState
+	blockSize       int
 }
 
-type txnStatus struct {
+type txnState struct {
 	sync.RWMutex
-	status      uint
-	incarnation int
+	txnStateInner
 }
 
-type txnBlockers struct {
-	sync.RWMutex
-	blockers map[int]struct{}
+type txnStateInner struct {
+	status       txStatus
+	incarnation  int
+	blockers     map[int]struct{} // blocking transactions for current transactoin
+	dependencies map[int]struct{} // blocked transactions  on current transaction
 }
-type txnDependency struct {
-	sync.RWMutex
-	dependencies map[int]struct{}
-}
+
+type txStatus uint
 
 const (
-	txnStatusReadyToExecute = 0
-	txnStatusExecuting      = 1
-	txnStatusExecuted       = 2
-	txnStatusAborting       = 3
+	txnStatusReadyToExecute txStatus = iota
+	txnStatusExecuting
+	txnStatusExecuted
+	txnStatusAborting
 )
 
 var _ Scheduler = (*scheduler)(nil)
 
 func NewScheduler(blockSize int) Scheduler {
-	allTxnStatus := make([]*txnStatus, blockSize)
-	allTxnDependency := make([]*txnDependency, blockSize)
-	allTxnBlockers := make([]*txnBlockers, blockSize)
+	allTxnStatus := make([]*txnState, blockSize)
 	for i := 0; i < blockSize; i++ {
-		allTxnStatus[i] = &txnStatus{}
-		allTxnDependency[i] = &txnDependency{}
-		allTxnBlockers[i] = &txnBlockers{}
+		allTxnStatus[i] = &txnState{}
 	}
 
-	return &scheduler{blockSize: blockSize, allTxnStatus: allTxnStatus, allTxnDependency: allTxnDependency, allTxnBlockers: allTxnBlockers}
+	return &scheduler{blockSize: blockSize, allTxnState: allTxnStatus}
 }
 
 func (s *scheduler) Done() bool {
@@ -73,59 +66,50 @@ func (s *scheduler) NextTask() *Task {
 }
 func (s *scheduler) AddDependency(index, blockingIndex int) bool {
 
-	txnDependency := s.allTxnDependency[blockingIndex]
-	txnDependency.Lock()
+	blockingTxnState := s.allTxnState[blockingIndex]
+	blockedTxnState := s.allTxnState[index]
 
-	txnStatus := s.allTxnStatus[blockingIndex]
-	txnStatus.Lock()
+	blockingTxnState.Lock()
 	// dependency resolved
-	if txnStatus.status == txnStatusExecuted {
-		txnStatus.Unlock()
-		txnDependency.Unlock()
+	if blockingTxnState.status == txnStatusExecuted {
+		blockingTxnState.Unlock()
 		return false
 	}
-	txnStatus.Unlock()
 
-	s.allTxnStatus[index].Lock()
-	s.allTxnStatus[index].status = txnStatusAborting
-	s.allTxnStatus[index].Unlock()
+	blockedTxnState.Lock()
+	blockedTxnState.status = txnStatusAborting
 
-	if txnDependency.dependencies == nil {
-		txnDependency.dependencies = make(map[int]struct{})
+	if blockingTxnState.dependencies == nil {
+		blockingTxnState.dependencies = make(map[int]struct{})
 	}
-	txnDependency.dependencies[index] = struct{}{}
+	blockingTxnState.dependencies[index] = struct{}{}
 
-	txnDependency.Unlock()
-
-	txnBlockers := s.allTxnBlockers[index]
-	txnBlockers.Lock()
-	if txnBlockers.blockers == nil {
-		txnBlockers.blockers = make(map[int]struct{})
+	if blockedTxnState.blockers == nil {
+		blockedTxnState.blockers = make(map[int]struct{})
 	}
-	txnBlockers.blockers[blockingIndex] = struct{}{}
-	txnBlockers.Unlock()
+	blockedTxnState.blockers[blockingIndex] = struct{}{}
+
+	blockedTxnState.Unlock()
+	blockingTxnState.Unlock()
 
 	// execution task aborted due to a dependency
 	s.numActiveTasks.Add(-1)
-	return false
+	return true
 }
 func (s *scheduler) FinishExecution(version Version, wroteNewLocation bool) *Task {
 
-	txnStatus := s.allTxnStatus[version.Index]
-	txnStatus.Lock()
-	if txnStatus.status != txnStatusExecuting {
+	txnState := s.allTxnState[version.Index]
+	txnState.Lock()
+	if txnState.status != txnStatusExecuting {
 		panic("status must have been EXECUTING")
 	}
-	txnStatus.status = txnStatusExecuted
-	txnStatus.Unlock()
+	txnState.status = txnStatusExecuted
 
-	txnDependency := s.allTxnDependency[version.Index]
-	txnDependency.Lock()
-	dependencies := txnDependency.dependencies
-	txnDependency.dependencies = nil
-	txnDependency.Unlock()
+	dependencies := txnState.dependencies
+	txnState.dependencies = nil
 
 	s.resumeDependencies(version.Index, dependencies)
+	txnState.Unlock()
 
 	if s.validationIndex.Load() > int32(version.Index) { // otherwise index already small enough
 		if wroteNewLocation {
@@ -136,7 +120,9 @@ func (s *scheduler) FinishExecution(version Version, wroteNewLocation bool) *Tas
 		}
 	}
 
+	// done with execution task
 	s.numActiveTasks.Add(-1)
+	// no task returned to the caller
 	return nil
 }
 
@@ -160,7 +146,7 @@ func (s *scheduler) FinishValidation(txnIndex int, aborted bool) *Task {
 	return nil
 }
 func (s *scheduler) TryValidationAbort(version Version) bool {
-	txnStatus := s.allTxnStatus[version.Index]
+	txnStatus := s.allTxnState[version.Index]
 	txnStatus.Lock()
 	defer txnStatus.Unlock()
 	if txnStatus.incarnation == version.Incarnation && txnStatus.status == txnStatusExecuted {
@@ -177,16 +163,20 @@ func (s *scheduler) resumeDependencies(blockingIndex int, dependencies map[int]s
 	}
 	minDepTxnIndex := -1
 	for depTxnIndex := range dependencies {
-		txnBlockers := s.allTxnBlockers[depTxnIndex]
-		txnBlockers.Lock()
-		delete(txnBlockers.blockers, blockingIndex)
-		canResume := len(txnBlockers.blockers) == 0
-		txnBlockers.Unlock()
+		txnState := s.allTxnState[depTxnIndex]
+
+		txnState.Lock()
+		delete(txnState.blockers, blockingIndex)
+		canResume := len(txnState.blockers) == 0
+
 		if canResume {
-			s.setReadyStatus(depTxnIndex)
+			s.setReadyStatusLocked(depTxnIndex)
+			txnState.Unlock()
 			if minDepTxnIndex == -1 || depTxnIndex < minDepTxnIndex {
 				minDepTxnIndex = depTxnIndex
 			}
+		} else {
+			txnState.Unlock()
 		}
 
 	}
@@ -198,11 +188,16 @@ func (s *scheduler) resumeDependencies(blockingIndex int, dependencies map[int]s
 }
 
 func (s *scheduler) setReadyStatus(txnIndex int) {
-	txnStatus := s.allTxnStatus[txnIndex]
+	txnStatus := s.allTxnState[txnIndex]
 	txnStatus.Lock()
+	s.setReadyStatusLocked(txnIndex)
+	txnStatus.Unlock()
+}
+
+func (s *scheduler) setReadyStatusLocked(txnIndex int) {
+	txnStatus := s.allTxnState[txnIndex]
 	txnStatus.incarnation += 1
 	txnStatus.status = txnStatusReadyToExecute
-	txnStatus.Unlock()
 }
 
 func (s *scheduler) nextVersionToValidate() *Version {
@@ -214,7 +209,7 @@ func (s *scheduler) nextVersionToValidate() *Version {
 	s.numActiveTasks.Add(1)
 	validationIndex := s.validationIndex.Add(1) - 1
 	if validationIndex < int32(s.blockSize) {
-		txnStatus := s.allTxnStatus[validationIndex]
+		txnStatus := s.allTxnState[validationIndex]
 		txnStatus.RLock()
 		status, incarnation := txnStatus.status, txnStatus.incarnation
 		txnStatus.RUnlock()
@@ -241,12 +236,13 @@ func (s *scheduler) nextVersionToExecute() *Version {
 
 func (s *scheduler) tryIncarnation(txnIndex int) *Version {
 	if txnIndex < s.blockSize {
-		txnStatus := s.allTxnStatus[txnIndex]
+		txnStatus := s.allTxnState[txnIndex]
 		txnStatus.Lock()
 		if txnStatus.status == txnStatusReadyToExecute {
 			txnStatus.status = txnStatusExecuting
+			version := &Version{Index: txnIndex, Incarnation: txnStatus.incarnation}
 			txnStatus.Unlock()
-			return &Version{Index: txnIndex, Incarnation: txnStatus.incarnation}
+			return version
 		}
 		txnStatus.Unlock()
 	}
